@@ -651,10 +651,40 @@ struct USBAudioState {
     uint32_t debug;
     uint32_t buffer_user, buffer;
     bool multi;
+    bool direct_playback;
 };
 
 #define TYPE_USB_AUDIO "usb-audio"
 OBJECT_DECLARE_SIMPLE_TYPE(USBAudioState, USB_AUDIO)
+
+static size_t output_queue_fast(USBAudioState *s)
+{
+    const size_t packet_size = USBAUDIO_PACKET_SIZE(s->out.channels);
+    size_t queued = 0;
+
+    if (!s->direct_playback) {
+        return 0;
+    }
+
+    for (;;) {
+        uint8_t *data;
+        size_t accepted, len;
+
+        data = streambuf_get(&s->out.buf, &len);
+        if (!data || len < packet_size) {
+            return queued;
+        }
+
+        accepted = audio_be_queue_out(s->audio_be, s->out.voice,
+                                      data, packet_size);
+        if (accepted != packet_size) {
+            return queued;
+        }
+
+        s->out.buf.cons += packet_size;
+        queued += packet_size;
+    }
+}
 
 static void output_callback(void *opaque, int avail)
 {
@@ -893,12 +923,22 @@ static void usb_audio_handle_reset(USBDevice *dev)
 
 static void usb_audio_handle_dataout(USBAudioState *s, USBPacket *p)
 {
+    int accepted;
+
     if (s->out.altset == ALTSET_OFF) {
         p->status = USB_RET_STALL;
         return;
     }
 
-    streambuf_put(&s->out.buf, p, s->out.channels);
+    accepted = streambuf_put(&s->out.buf, p, s->out.channels);
+    if (accepted) {
+        output_queue_fast(s);
+    }
+    if (s->direct_playback &&
+        s->out.buf.prod != s->out.buf.cons) {
+        audio_be_notify_out(s->audio_be, s->out.voice);
+    }
+
     if (p->actual_length < p->iov.size && s->debug > 1) {
         fprintf(stderr, "usb-audio: output overrun (%zd bytes)\n",
                 p->iov.size - p->actual_length);
@@ -994,6 +1034,8 @@ static const Property usb_audio_properties[] = {
     DEFINE_PROP_UINT32("debug", USBAudioState, debug, 0),
     DEFINE_PROP_UINT32("buffer", USBAudioState, buffer_user, 0),
     DEFINE_PROP_BOOL("multi", USBAudioState, multi, false),
+    DEFINE_PROP_BOOL("direct-playback", USBAudioState,
+                     direct_playback, false),
 };
 
 static void usb_audio_class_init(ObjectClass *klass, const void *data)
