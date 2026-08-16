@@ -402,6 +402,16 @@ static void audio_validate_opts(Audiodev *dev, Error **errp)
         return;
     }
 
+#ifdef CONFIG_AUDIO_PIPEWIRE
+    if (dev->driver == AUDIODEV_DRIVER_PIPEWIRE &&
+        dev->u.pipewire.try_poll &&
+        audio_get_pdo_out(dev)->mixing_engine) {
+        error_setg(errp,
+                   "pipewire try-poll requires out.mixing-engine=off");
+        return;
+    }
+#endif
+
     if (!dev->has_timer_period) {
         dev->has_timer_period = true;
         dev->timer_period = 10000; /* 100Hz -> 10ms */

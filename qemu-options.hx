@@ -887,6 +887,7 @@ DEF("audiodev", HAS_ARG, QEMU_OPTION_audiodev,
     "                in|out.name= source/sink device name\n"
     "                in|out.stream-name= name of pipewire stream\n"
     "                in|out.latency= desired latency in microseconds\n"
+    "                try-poll= attempt to use poll mode for playback\n"
 #endif
 #ifdef CONFIG_AUDIO_SDL
     "-audiodev sdl,id=id[,prop=value[,...]]\n"
@@ -1080,6 +1081,11 @@ SRST
 
     ``in|out.stream-name``
         Specify the name of pipewire stream.
+
+    ``try-poll=on|off``
+        Attempt to use poll mode for playback packets instead of the
+        general audio timer. This requires ``out.mixing-engine=off``.
+        Default is off.
 
 ``-audiodev sdl,id=id[,prop=value[,...]]``
     Creates a backend using SDL. This backend is available on most

@@ -381,12 +381,18 @@
 #
 # @out: options of the playback stream
 #
+# @try-poll: attempt to use poll mode for playback packets, falling
+#     back to the audio timer if poll mode cannot be initialized.
+#     This requires @out.mixing-engine=off.  (Since: 11.2)
+#     (default false)
+#
 # Since: 8.1
 ##
 { 'struct': 'AudiodevPipewireOptions',
   'data': {
-    '*in':     'AudiodevPipewirePerDirectionOptions',
-    '*out':    'AudiodevPipewirePerDirectionOptions' } }
+    '*in':       'AudiodevPipewirePerDirectionOptions',
+    '*out':      'AudiodevPipewirePerDirectionOptions',
+    '*try-poll': 'bool' } }
 
 ##
 # @AudiodevSdlPerDirectionOptions:
