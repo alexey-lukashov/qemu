@@ -21,9 +21,12 @@
 
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
+#include "qemu/event_notifier.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qemu/queue.h"
+#include "qemu/thread.h"
 #include "migration/vmstate.h"
 #include "hw/core/qdev-properties.h"
 #include "trace.h"
@@ -43,6 +46,9 @@
 #define TRB_LINK_LIMIT  32
 #define COMMAND_LIMIT   256
 #define TRANSFER_LIMIT  256
+
+#define XHCI_ISO_SCHEDULER_TICK_NS (500 * SCALE_US)
+#define XHCI_ENDPOINTS_PER_SLOT     31
 
 #define LEN_CAP         0x40
 #define LEN_OPER        (0x400 + 0x10 * XHCI_MAXPORTS)
@@ -295,6 +301,29 @@ struct XHCIEPContext {
     unsigned int interval;
     int64_t mfindex_last;
     QEMUTimer *kick_timer;
+    uint32_t iso_generation;
+};
+
+typedef struct XHCIIsoScheduleEntry {
+    int64_t deadline_ns;
+    uint32_t generation;
+} XHCIIsoScheduleEntry;
+
+typedef struct XHCIIsoWork {
+    uint32_t generation;
+    uint8_t slotid;
+    uint8_t epid;
+} XHCIIsoWork;
+
+struct XHCIIsoScheduler {
+    XHCIState *xhci;
+    EventNotifier event;
+    QemuThread thread;
+    QemuMutex lock;
+    bool stopping;
+    bool started;
+    XHCIIsoScheduleEntry entries[XHCI_MAXSLOTS]
+                                      [XHCI_ENDPOINTS_PER_SLOT];
 };
 
 typedef struct XHCIEvRingSeg {
@@ -307,6 +336,9 @@ typedef struct XHCIEvRingSeg {
 static void xhci_kick_ep(XHCIState *xhci, unsigned int slotid,
                          unsigned int epid, unsigned int streamid);
 static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid);
+static void xhci_ep_kick_timer_del(XHCIEPContext *epctx);
+static void xhci_ep_kick_timer_mod(XHCIEPContext *epctx,
+                                   int64_t deadline_ns);
 static TRBCCode xhci_disable_ep(XHCIState *xhci, unsigned int slotid,
                                 unsigned int epid);
 static void xhci_xfer_report(XHCITransfer *xfer);
@@ -1093,6 +1125,252 @@ static void xhci_ep_kick_timer(void *opaque)
     xhci_kick_epctx(epctx, 0);
 }
 
+static bool xhci_ep_uses_iso_scheduler(const XHCIEPContext *epctx)
+{
+    return epctx->xhci->iso_scheduler &&
+           (epctx->type == ET_ISO_OUT || epctx->type == ET_ISO_IN);
+}
+
+static uint32_t xhci_iso_generation_next(XHCIState *xhci,
+                                         unsigned int slotid,
+                                         unsigned int epid)
+{
+    XHCIIsoScheduler *sched = xhci->iso_scheduler;
+    XHCIIsoScheduleEntry *entry;
+    uint32_t generation;
+
+    if (!sched) {
+        return 0;
+    }
+
+    entry = &sched->entries[slotid - 1][epid - 1];
+    qemu_mutex_lock(&sched->lock);
+    generation = ++entry->generation;
+    if (generation == 0) {
+        generation = ++entry->generation;
+    }
+    entry->deadline_ns = -1;
+    qemu_mutex_unlock(&sched->lock);
+    event_notifier_set(&sched->event);
+    return generation;
+}
+
+static void xhci_iso_schedule(XHCIEPContext *epctx, int64_t deadline_ns)
+{
+    XHCIIsoScheduler *sched = epctx->xhci->iso_scheduler;
+    XHCIIsoScheduleEntry *entry;
+
+    if (!sched || qatomic_read(&sched->stopping)) {
+        return;
+    }
+
+    entry = &sched->entries[epctx->slotid - 1][epctx->epid - 1];
+    qemu_mutex_lock(&sched->lock);
+    if (entry->generation == epctx->iso_generation &&
+        !qatomic_read(&sched->stopping)) {
+        entry->deadline_ns = deadline_ns;
+    }
+    qemu_mutex_unlock(&sched->lock);
+    event_notifier_set(&sched->event);
+}
+
+static void xhci_iso_cancel(XHCIEPContext *epctx)
+{
+    XHCIIsoScheduler *sched = epctx->xhci->iso_scheduler;
+    XHCIIsoScheduleEntry *entry;
+
+    if (!sched) {
+        return;
+    }
+
+    entry = &sched->entries[epctx->slotid - 1][epctx->epid - 1];
+    qemu_mutex_lock(&sched->lock);
+    if (entry->generation == epctx->iso_generation) {
+        entry->deadline_ns = -1;
+    }
+    qemu_mutex_unlock(&sched->lock);
+    event_notifier_set(&sched->event);
+}
+
+static void xhci_ep_kick_timer_del(XHCIEPContext *epctx)
+{
+    if (xhci_ep_uses_iso_scheduler(epctx)) {
+        xhci_iso_cancel(epctx);
+    }
+    timer_del(epctx->kick_timer);
+}
+
+static void xhci_ep_kick_timer_mod(XHCIEPContext *epctx,
+                                   int64_t deadline_ns)
+{
+    if (xhci_ep_uses_iso_scheduler(epctx)) {
+        timer_del(epctx->kick_timer);
+        xhci_iso_schedule(epctx, deadline_ns);
+    } else {
+        timer_mod(epctx->kick_timer, deadline_ns);
+    }
+}
+
+static bool xhci_iso_claim_due(XHCIIsoScheduler *sched, int64_t now_ns,
+                               XHCIIsoWork *work, int64_t *next_deadline_ns)
+{
+    int64_t earliest = -1;
+    unsigned int earliest_slot = 0;
+    unsigned int earliest_ep = 0;
+    unsigned int slot, ep;
+    bool due = false;
+
+    qemu_mutex_lock(&sched->lock);
+    for (slot = 0; slot < XHCI_MAXSLOTS; slot++) {
+        for (ep = 0; ep < XHCI_ENDPOINTS_PER_SLOT; ep++) {
+            int64_t deadline = sched->entries[slot][ep].deadline_ns;
+
+            if (deadline >= 0 && (earliest < 0 || deadline < earliest)) {
+                earliest = deadline;
+                earliest_slot = slot;
+                earliest_ep = ep;
+            }
+        }
+    }
+
+    if (earliest >= 0 && earliest <= now_ns) {
+        XHCIIsoScheduleEntry *entry =
+            &sched->entries[earliest_slot][earliest_ep];
+
+        work->generation = entry->generation;
+        work->slotid = earliest_slot + 1;
+        work->epid = earliest_ep + 1;
+        entry->deadline_ns = -1;
+        due = true;
+    }
+    qemu_mutex_unlock(&sched->lock);
+
+    *next_deadline_ns = due ? -1 : earliest;
+    return due;
+}
+
+static void xhci_iso_service(XHCIIsoScheduler *sched,
+                             const XHCIIsoWork *work)
+{
+    XHCIState *xhci = sched->xhci;
+    XHCIEPContext *epctx = NULL;
+
+    bql_lock();
+
+    if (!qatomic_read(&sched->stopping) &&
+        work->slotid >= 1 && work->slotid <= xhci->numslots &&
+        work->epid >= 1 && work->epid <= XHCI_ENDPOINTS_PER_SLOT) {
+        epctx = xhci->slots[work->slotid - 1].eps[work->epid - 1];
+    }
+
+    if (epctx && epctx->iso_generation == work->generation &&
+        xhci_ep_uses_iso_scheduler(epctx)) {
+        xhci_kick_epctx(epctx, 0);
+    }
+
+    bql_unlock();
+}
+
+static void *xhci_iso_scheduler_thread(void *opaque)
+{
+    XHCIIsoScheduler *sched = opaque;
+    GPollFD pfd = {
+        .fd = event_notifier_get_fd(&sched->event),
+        .events = G_IO_IN | G_IO_ERR | G_IO_HUP,
+    };
+
+    while (!qatomic_read(&sched->stopping)) {
+        XHCIIsoWork work;
+        int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        int64_t next_deadline_ns;
+
+        if (xhci_iso_claim_due(sched, now_ns, &work, &next_deadline_ns)) {
+            xhci_iso_service(sched, &work);
+            continue;
+        }
+
+        pfd.revents = 0;
+        if (next_deadline_ns < 0) {
+            qemu_poll_ns(&pfd, 1, -1);
+        } else {
+            int64_t timeout_ns = MAX(next_deadline_ns - now_ns, 0);
+
+            qemu_poll_ns(&pfd, 1,
+                         MIN(timeout_ns, XHCI_ISO_SCHEDULER_TICK_NS));
+        }
+        if (pfd.revents) {
+            event_notifier_test_and_clear(&sched->event);
+        }
+    }
+
+    return NULL;
+}
+
+static bool xhci_iso_scheduler_start(XHCIState *xhci, Error **errp)
+{
+    XHCIIsoScheduler *sched;
+    unsigned int slot, ep;
+    int ret;
+
+    if (!xhci->iso_thread) {
+        return true;
+    }
+
+    sched = g_new0(XHCIIsoScheduler, 1);
+    sched->xhci = xhci;
+    for (slot = 0; slot < XHCI_MAXSLOTS; slot++) {
+        for (ep = 0; ep < XHCI_ENDPOINTS_PER_SLOT; ep++) {
+            sched->entries[slot][ep].deadline_ns = -1;
+        }
+    }
+
+    qemu_mutex_init(&sched->lock);
+    ret = event_notifier_init(&sched->event, 0);
+    if (ret < 0) {
+        error_setg_errno(errp, -ret,
+                         "failed to initialize xHCI ISO scheduler event");
+        qemu_mutex_destroy(&sched->lock);
+        g_free(sched);
+        return false;
+    }
+
+    xhci->iso_scheduler = sched;
+    qemu_thread_create(&sched->thread, "xhci-iso",
+                       xhci_iso_scheduler_thread, sched,
+                       QEMU_THREAD_JOINABLE);
+    sched->started = true;
+    return true;
+}
+
+static void xhci_iso_scheduler_stop(XHCIState *xhci)
+{
+    XHCIIsoScheduler *sched = xhci->iso_scheduler;
+    bool had_bql;
+
+    if (!sched) {
+        return;
+    }
+
+    qatomic_set(&sched->stopping, true);
+    event_notifier_set(&sched->event);
+    if (sched->started) {
+        had_bql = bql_locked();
+        if (had_bql) {
+            bql_unlock();
+        }
+        qemu_thread_join(&sched->thread);
+        if (had_bql) {
+            bql_lock();
+        }
+        sched->started = false;
+    }
+
+    xhci->iso_scheduler = NULL;
+    event_notifier_cleanup(&sched->event);
+    qemu_mutex_destroy(&sched->lock);
+    g_free(sched);
+}
+
 static XHCIEPContext *xhci_alloc_epctx(XHCIState *xhci,
                                        unsigned int slotid,
                                        unsigned int epid)
@@ -1106,6 +1384,7 @@ static XHCIEPContext *xhci_alloc_epctx(XHCIState *xhci,
 
     QTAILQ_INIT(&epctx->transfers);
     epctx->kick_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, xhci_ep_kick_timer, epctx);
+    epctx->iso_generation = xhci_iso_generation_next(xhci, slotid, epid);
 
     return epctx;
 }
@@ -1221,7 +1500,7 @@ static int xhci_ep_nuke_one_xfer(XHCITransfer *t, TRBCCode report)
     if (t->running_retry) {
         if (t->epctx) {
             t->epctx->retry = NULL;
-            timer_del(t->epctx->kick_timer);
+            xhci_ep_kick_timer_del(t->epctx);
         }
         t->running_retry = 0;
         killed = 1;
@@ -1304,6 +1583,7 @@ static TRBCCode xhci_disable_ep(XHCIState *xhci, unsigned int slotid,
         xhci_set_ep_state(xhci, epctx, NULL, EP_DISABLED);
     }
 
+    xhci_ep_kick_timer_del(epctx);
     timer_free(epctx->kick_timer);
     g_free(epctx);
     slot->eps[epid-1] = NULL;
@@ -1780,12 +2060,13 @@ static void xhci_check_intr_iso_kick(XHCIState *xhci, XHCITransfer *xfer,
                                      XHCIEPContext *epctx, uint64_t mfindex)
 {
     if (xfer->mfindex_kick > mfindex) {
-        timer_mod(epctx->kick_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                       (xfer->mfindex_kick - mfindex) * 125000);
+        xhci_ep_kick_timer_mod(
+            epctx, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                   (xfer->mfindex_kick - mfindex) * 125000);
         xfer->running_retry = 1;
     } else {
         epctx->mfindex_last = xfer->mfindex_kick;
-        timer_del(epctx->kick_timer);
+        xhci_ep_kick_timer_del(epctx);
         xfer->running_retry = 0;
     }
 }
@@ -3436,6 +3717,10 @@ static void usb_xhci_realize(DeviceState *dev, Error **errp)
     }
 
     usb_xhci_init(xhci);
+    if (!xhci_iso_scheduler_start(xhci, errp)) {
+        usb_bus_release(&xhci->bus);
+        return;
+    }
     xhci->mfwrap_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, xhci_mfwrap_timer, xhci);
 
     memory_region_init(&xhci->mem, OBJECT(dev), "xhci", XHCI_LEN_REGS);
@@ -3469,6 +3754,8 @@ static void usb_xhci_unrealize(DeviceState *dev)
     XHCIState *xhci = XHCI(dev);
 
     trace_usb_xhci_exit();
+
+    xhci_iso_scheduler_stop(xhci);
 
     for (i = 0; i < xhci->numslots; i++) {
         xhci_disable_slot(xhci, i + 1);
@@ -3536,7 +3823,8 @@ static int usb_xhci_post_load(void *opaque, int version_id)
             epctx->state = state;
             if (state == EP_RUNNING) {
                 /* kick endpoint after vmload is finished */
-                timer_mod(epctx->kick_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+                xhci_ep_kick_timer_mod(
+                    epctx, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
             }
         }
     }
@@ -3660,6 +3948,7 @@ static const Property xhci_properties[] = {
                     XHCI_FLAG_ENABLE_STREAMS, true),
     DEFINE_PROP_UINT32("p2",    XHCIState, numports_2, 4),
     DEFINE_PROP_UINT32("p3",    XHCIState, numports_3, 4),
+    DEFINE_PROP_BOOL("iso-thread", XHCIState, iso_thread, false),
     DEFINE_PROP_LINK("host",    XHCIState, hostOpaque, TYPE_DEVICE,
                      DeviceState *),
 };

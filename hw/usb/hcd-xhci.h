@@ -34,6 +34,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(XHCIState, XHCI)
 
 typedef struct XHCIStreamContext XHCIStreamContext;
 typedef struct XHCIEPContext XHCIEPContext;
+typedef struct XHCIIsoScheduler XHCIIsoScheduler;
 
 enum xhci_flags {
     XHCI_FLAG_ENABLE_STREAMS = 1,
@@ -191,6 +192,7 @@ typedef struct XHCIState {
     uint32_t numslots;
     uint32_t flags;
     uint32_t max_pstreams_mask;
+    bool iso_thread;
     void (*intr_update)(XHCIState *s, int n, bool enable);
     bool (*intr_raise)(XHCIState *s, int n, bool level);
     /*
@@ -221,6 +223,8 @@ typedef struct XHCIState {
     XHCIInterrupter intr[XHCI_MAXINTRS];
 
     XHCIRing cmd_ring;
+
+    XHCIIsoScheduler *iso_scheduler;
 
     bool nec_quirks;
 } XHCIState;

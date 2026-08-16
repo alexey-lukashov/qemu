@@ -63,7 +63,8 @@ static void test_xhci_unplug_finalize(void)
 
     qtest = qtest_initf("-machine pc");
 
-    qtest_qmp_device_add(qtest, "nec-usb-xhci", "xhci-finalize", "{}");
+    qtest_qmp_device_add(qtest, "nec-usb-xhci", "xhci-finalize",
+                         "{'iso-thread': true}");
 
     /*
      * Request device removal. As the guest is not running, the unplug request
