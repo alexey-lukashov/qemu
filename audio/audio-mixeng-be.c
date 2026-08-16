@@ -647,6 +647,42 @@ static size_t audio_mixeng_backend_write(AudioBackend *be, SWVoiceOut *sw,
     }
 }
 
+static size_t audio_mixeng_backend_queue_out(AudioBackend *be, SWVoiceOut *sw,
+                                             const void *buf, size_t size)
+{
+    AudioMixengBackendClass *k;
+    HWVoiceOut *hw;
+
+    if (!sw) {
+        return 0;
+    }
+
+    hw = sw->hw;
+    k = AUDIO_MIXENG_BACKEND_GET_CLASS(hw->s);
+    if (!hw->enabled || audio_get_pdo_out(hw->s->dev)->mixing_engine ||
+        !k->queue_out) {
+        return 0;
+    }
+
+    return k->queue_out(hw, buf, size);
+}
+
+static void audio_mixeng_backend_notify_out(AudioBackend *be, SWVoiceOut *sw)
+{
+    AudioMixengBackendClass *k;
+    HWVoiceOut *hw;
+
+    if (!sw) {
+        return;
+    }
+
+    hw = sw->hw;
+    k = AUDIO_MIXENG_BACKEND_GET_CLASS(hw->s);
+    if (hw->enabled && k->notify_out) {
+        k->notify_out(hw);
+    }
+}
+
 static size_t audio_mixeng_backend_read(AudioBackend *be,
                                         SWVoiceIn *sw, void *buf, size_t size)
 {
@@ -1444,6 +1480,8 @@ static void audio_mixeng_backend_class_init(ObjectClass *klass, const void *data
     be->set_volume_in = audio_mixeng_backend_set_volume_in;
     be->read = audio_mixeng_backend_read;
     be->write = audio_mixeng_backend_write;
+    be->queue_out = audio_mixeng_backend_queue_out;
+    be->notify_out = audio_mixeng_backend_notify_out;
     be->get_buffer_size_out = audio_mixeng_backend_get_buffer_size_out;
     be->add_capture = audio_mixeng_backend_add_capture;
     be->del_capture = audio_mixeng_backend_del_capture;

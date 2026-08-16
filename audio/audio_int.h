@@ -183,6 +183,8 @@ struct AudioMixengBackendClass {
     int    (*init_out)(HWVoiceOut *hw, audsettings *as);
     void   (*fini_out)(HWVoiceOut *hw);
     size_t (*write)   (HWVoiceOut *hw, void *buf, size_t size);
+    size_t (*queue_out)(HWVoiceOut *hw, const void *buf, size_t size);
+    void   (*notify_out)(HWVoiceOut *hw);
     void   (*run_buffer_out)(HWVoiceOut *hw);
     /*
      * Get the free output buffer size. This is an upper limit. The size

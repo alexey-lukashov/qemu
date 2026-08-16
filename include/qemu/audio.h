@@ -93,6 +93,9 @@ typedef struct AudioBackendClass {
     void (*set_volume_out)(AudioBackend *be, SWVoiceOut *sw, Volume *vol);
     void (*set_volume_in)(AudioBackend *be, SWVoiceIn *sw, Volume *vol);
     size_t (*write)(AudioBackend *be, SWVoiceOut *sw, void *buf, size_t size);
+    size_t (*queue_out)(AudioBackend *be, SWVoiceOut *sw,
+                        const void *buf, size_t size);
+    void (*notify_out)(AudioBackend *be, SWVoiceOut *sw);
     size_t (*read)(AudioBackend *be, SWVoiceIn *sw, void *buf, size_t size);
     int (*get_buffer_size_out)(AudioBackend *be, SWVoiceOut *sw);
     CaptureVoiceOut *(*add_capture)(AudioBackend *be,
@@ -123,6 +126,9 @@ SWVoiceOut *audio_be_open_out(
 
 void audio_be_close_out(AudioBackend *be, SWVoiceOut *sw);
 size_t audio_be_write(AudioBackend *be, SWVoiceOut *sw, void *pcm_buf, size_t size);
+size_t audio_be_queue_out(AudioBackend *be, SWVoiceOut *sw,
+                          const void *pcm_buf, size_t size);
+void audio_be_notify_out(AudioBackend *be, SWVoiceOut *sw);
 int  audio_be_get_buffer_size_out(AudioBackend *be, SWVoiceOut *sw);
 void audio_be_set_active_out(AudioBackend *be, SWVoiceOut *sw, bool on);
 bool audio_be_is_active_out(AudioBackend *be, SWVoiceOut *sw);

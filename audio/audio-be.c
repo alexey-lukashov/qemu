@@ -110,6 +110,29 @@ size_t audio_be_write(AudioBackend *be, SWVoiceOut *sw, void *buf, size_t size)
     return klass->write(be, sw, buf, size);
 }
 
+size_t audio_be_queue_out(AudioBackend *be, SWVoiceOut *sw,
+                          const void *buf, size_t size)
+{
+    AudioBackendClass *klass = AUDIO_BACKEND_GET_CLASS(be);
+
+    if (!sw || !klass->queue_out) {
+        return 0;
+    }
+
+    return klass->queue_out(be, sw, buf, size);
+}
+
+void audio_be_notify_out(AudioBackend *be, SWVoiceOut *sw)
+{
+    AudioBackendClass *klass = AUDIO_BACKEND_GET_CLASS(be);
+
+    if (!sw || !klass->notify_out) {
+        return;
+    }
+
+    klass->notify_out(be, sw);
+}
+
 size_t audio_be_read(AudioBackend *be, SWVoiceIn *sw, void *buf, size_t size)
 {
     AudioBackendClass *klass = AUDIO_BACKEND_GET_CLASS(be);
