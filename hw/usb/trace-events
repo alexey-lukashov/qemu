@@ -190,6 +190,10 @@ usb_xhci_xfer_nak(void *xfer) "%p"
 usb_xhci_xfer_retry(void *xfer) "%p"
 usb_xhci_xfer_success(void *xfer, uint32_t bytes) "%p: len %d"
 usb_xhci_xfer_error(void *xfer, uint32_t ret) "%p: ret %d"
+audio_diag_xhci_service(uint32_t slotid, uint32_t epid, int64_t wake_late_us, int64_t bql_wait_us, int64_t service_late_us) "slotid=%u epid=%u wake_late_us=%" PRId64 " bql_wait_us=%" PRId64 " service_late_us=%" PRId64
+audio_diag_xhci_stale(uint32_t slotid, uint32_t epid, uint32_t generation, uint32_t current_generation) "slotid=%u epid=%u generation=%u current_generation=%u"
+audio_diag_usb_packet(size_t requested, int actual, int accepted, size_t queued, uint64_t buffered) "requested=%zu actual=%d accepted=%d queued=%zu buffered=%" PRIu64
+audio_diag_usb_queue(size_t requested, size_t accepted, size_t available, uint64_t buffered) "requested=%zu accepted=%zu available=%zu buffered=%" PRIu64
 usb_xhci_unimplemented(const char *item, int nr) "%s (0x%x)"
 usb_xhci_enforced_limit(const char *item) "%s"
 

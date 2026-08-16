@@ -37,6 +37,7 @@
 #include "desc.h"
 #include "qemu/audio.h"
 #include "qom/object.h"
+#include "trace.h"
 
 static void usb_audio_reinit(USBDevice *dev, unsigned channels);
 
@@ -677,6 +678,8 @@ static size_t output_queue_fast(USBAudioState *s)
 
         accepted = audio_be_queue_out(s->audio_be, s->out.voice,
                                       data, packet_size);
+        trace_audio_diag_usb_queue(packet_size, accepted, len,
+                                   s->out.buf.prod - s->out.buf.cons);
         if (accepted != packet_size) {
             return queued;
         }
@@ -924,6 +927,7 @@ static void usb_audio_handle_reset(USBDevice *dev)
 static void usb_audio_handle_dataout(USBAudioState *s, USBPacket *p)
 {
     int accepted;
+    size_t queued = 0;
 
     if (s->out.altset == ALTSET_OFF) {
         p->status = USB_RET_STALL;
@@ -932,12 +936,15 @@ static void usb_audio_handle_dataout(USBAudioState *s, USBPacket *p)
 
     accepted = streambuf_put(&s->out.buf, p, s->out.channels);
     if (accepted) {
-        output_queue_fast(s);
+        queued = output_queue_fast(s);
     }
     if (s->direct_playback &&
         s->out.buf.prod != s->out.buf.cons) {
         audio_be_notify_out(s->audio_be, s->out.voice);
     }
+    trace_audio_diag_usb_packet(p->iov.size, p->actual_length, accepted,
+                                queued,
+                                s->out.buf.prod - s->out.buf.cons);
 
     if (p->actual_length < p->iov.size && s->debug > 1) {
         fprintf(stderr, "usb-audio: output overrun (%zd bytes)\n",

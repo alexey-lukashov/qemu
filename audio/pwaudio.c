@@ -59,6 +59,7 @@ typedef struct pwvolume {
 
 typedef struct PWTransportPacket {
     uint32_t len;
+    int64_t queued_ns;
     uint8_t data[PW_TRANSPORT_PACKET_MAX];
 } PWTransportPacket;
 
@@ -148,7 +149,30 @@ static void qpw_transport_drain(PWVoiceOut *pw)
 
         packet = &pw->transport_packets[cons % PW_TRANSPORT_SLOTS];
         if (!qpw_transport_write_locked(pw, packet)) {
+            if (trace_event_get_state_backends(
+                    TRACE_AUDIO_DIAG_PW_TRANSPORT_BLOCKED)) {
+                uint32_t index;
+                int32_t filled = spa_ringbuffer_get_write_index(&pw->v.ring,
+                                                                 &index);
+
+                trace_audio_diag_pw_transport_blocked(packet->len,
+                                                       prod - cons, filled);
+            }
             break;
+        }
+
+        if (trace_event_get_state_backends(
+                TRACE_AUDIO_DIAG_PW_TRANSPORT_DRAIN)) {
+            uint32_t index;
+            int32_t filled = spa_ringbuffer_get_write_index(&pw->v.ring,
+                                                             &index);
+            int64_t queued_us = packet->queued_ns > 0 ?
+                (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) -
+                 packet->queued_ns) / SCALE_US : -1;
+
+            trace_audio_diag_pw_transport_drain(packet->len,
+                                                 prod - cons - 1,
+                                                 filled, queued_us);
         }
         qatomic_store_release(&pw->transport_cons, cons + 1);
     }
@@ -169,9 +193,10 @@ static void *qpw_transport_thread(void *opaque)
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         int64_t timeout_ns = qatomic_read(&pw->transport_enabled) ?
                              MAX(next_tick - now, 0) : -1;
+        int ret;
 
         pfd.revents = 0;
-        qemu_poll_ns(&pfd, 1, timeout_ns);
+        ret = qemu_poll_ns(&pfd, 1, timeout_ns);
         if (pfd.revents) {
             event_notifier_test_and_clear(&pw->transport_event);
         }
@@ -180,6 +205,15 @@ static void *qpw_transport_thread(void *opaque)
         }
 
         now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        if (trace_event_get_state_backends(
+                TRACE_AUDIO_DIAG_PW_TRANSPORT_WAKE)) {
+            uint32_t prod = qatomic_load_acquire(&pw->transport_prod);
+            uint32_t cons = qatomic_read(&pw->transport_cons);
+
+            trace_audio_diag_pw_transport_wake(ret > 0,
+                                                (now - next_tick) / SCALE_US,
+                                                prod - cons);
+        }
         if (now >= next_tick) {
             int64_t elapsed_ticks =
                 (now - next_tick) / PW_TRANSPORT_TICK_NS + 1;
@@ -212,14 +246,21 @@ static size_t qpw_queue_out(HWVoiceOut *hw, const void *data, size_t len)
     prod = qatomic_read(&pw->transport_prod);
     cons = qatomic_load_acquire(&pw->transport_cons);
     if (prod - cons >= PW_TRANSPORT_SLOTS) {
+        trace_audio_diag_pw_transport_drop(len, prod - cons);
         return len;
     }
 
     packet = &pw->transport_packets[prod % PW_TRANSPORT_SLOTS];
     packet->len = len;
+    packet->queued_ns = 0;
+    if (trace_event_get_state_backends(
+            TRACE_AUDIO_DIAG_PW_TRANSPORT_DRAIN)) {
+        packet->queued_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    }
     memcpy(packet->data, data, len);
 
     qatomic_store_release(&pw->transport_prod, prod + 1);
+    trace_audio_diag_pw_transport_enqueue(len, prod - cons + 1);
     event_notifier_set(&pw->transport_event);
     return len;
 }
@@ -234,8 +275,11 @@ playback_on_process(void *data)
     struct pw_buffer *b;
     struct spa_buffer *buf;
     uint32_t req, index, n_bytes, requested;
+    uint32_t delivered = 0;
     int32_t avail;
     bool output_silence = false;
+    bool was_prebuffering;
+    bool entered_rebuffer = false;
 
     assert(v->stream);
 
@@ -274,6 +318,7 @@ playback_on_process(void *data)
     }
 
     requested = n_bytes;
+    was_prebuffering = v->prebuffering;
     if (v->prebuffering) {
         if (avail < (int32_t)v->highwater_mark) {
             output_silence = true;
@@ -283,6 +328,7 @@ playback_on_process(void *data)
     }
 
     if (!output_silence && avail < (int32_t)requested) {
+        entered_rebuffer = !v->prebuffering;
         v->prebuffering = true;
         if (avail <= 0) {
             output_silence = true;
@@ -295,6 +341,7 @@ playback_on_process(void *data)
     } else {
         uint32_t real_bytes = MIN((uint32_t)avail, requested);
 
+        delivered = real_bytes;
         spa_ringbuffer_read_data(&v->ring,
                                     v->buffer, RINGBUFFER_SIZE,
                                     index & RINGBUFFER_MASK, p, real_bytes);
@@ -308,6 +355,13 @@ playback_on_process(void *data)
                                      (requested - real_bytes) / v->frame_size);
         }
         n_bytes = requested;
+    }
+
+    trace_audio_diag_pw_playback(avail, requested, v->highwater_mark,
+                                 was_prebuffering, v->prebuffering,
+                                 delivered, output_silence);
+    if (entered_rebuffer) {
+        trace_audio_diag_pw_rebuffer(avail, requested, v->highwater_mark);
     }
 
 queue_buffer:

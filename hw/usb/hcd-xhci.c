@@ -310,6 +310,7 @@ typedef struct XHCIIsoScheduleEntry {
 } XHCIIsoScheduleEntry;
 
 typedef struct XHCIIsoWork {
+    int64_t deadline_ns;
     uint32_t generation;
     uint8_t slotid;
     uint8_t epid;
@@ -1237,6 +1238,7 @@ static bool xhci_iso_claim_due(XHCIIsoScheduler *sched, int64_t now_ns,
         XHCIIsoScheduleEntry *entry =
             &sched->entries[earliest_slot][earliest_ep];
 
+        work->deadline_ns = entry->deadline_ns;
         work->generation = entry->generation;
         work->slotid = earliest_slot + 1;
         work->epid = earliest_ep + 1;
@@ -1250,12 +1252,23 @@ static bool xhci_iso_claim_due(XHCIIsoScheduler *sched, int64_t now_ns,
 }
 
 static void xhci_iso_service(XHCIIsoScheduler *sched,
-                             const XHCIIsoWork *work)
+                             const XHCIIsoWork *work,
+                             int64_t wake_ns)
 {
     XHCIState *xhci = sched->xhci;
     XHCIEPContext *epctx = NULL;
+    bool trace_service = trace_event_get_state_backends(
+        TRACE_AUDIO_DIAG_XHCI_SERVICE);
+    int64_t before_bql_ns = 0;
+    int64_t after_bql_ns = 0;
 
+    if (trace_service) {
+        before_bql_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    }
     bql_lock();
+    if (trace_service) {
+        after_bql_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    }
 
     if (!qatomic_read(&sched->stopping) &&
         work->slotid >= 1 && work->slotid <= xhci->numslots &&
@@ -1265,7 +1278,20 @@ static void xhci_iso_service(XHCIIsoScheduler *sched,
 
     if (epctx && epctx->iso_generation == work->generation &&
         xhci_ep_uses_iso_scheduler(epctx)) {
+        if (trace_service) {
+            int64_t service_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+            trace_audio_diag_xhci_service(
+                work->slotid, work->epid,
+                MAX(wake_ns - work->deadline_ns, 0) / SCALE_US,
+                (after_bql_ns - before_bql_ns) / SCALE_US,
+                MAX(service_ns - work->deadline_ns, 0) / SCALE_US);
+        }
         xhci_kick_epctx(epctx, 0);
+    } else {
+        trace_audio_diag_xhci_stale(
+            work->slotid, work->epid, work->generation,
+            epctx ? epctx->iso_generation : 0);
     }
 
     bql_unlock();
@@ -1285,7 +1311,7 @@ static void *xhci_iso_scheduler_thread(void *opaque)
         int64_t next_deadline_ns;
 
         if (xhci_iso_claim_due(sched, now_ns, &work, &next_deadline_ns)) {
-            xhci_iso_service(sched, &work);
+            xhci_iso_service(sched, &work, now_ns);
             continue;
         }
 
