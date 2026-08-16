@@ -28,6 +28,7 @@
 #include "hw/virtio/virtio-bus.h"
 #include "hw/core/qdev-properties.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "qemu/memfd.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
@@ -462,6 +463,7 @@ static void virtio_gpu_transfer_to_host_2d(VirtIOGPU *g,
     pixman_format_code_t format;
     struct virtio_gpu_transfer_to_host_2d t2d;
     void *img_data;
+    bool had_bql;
 
     VIRTIO_GPU_FILL_CMD(t2d);
     virtio_gpu_t2d_bswap(&t2d);
@@ -492,6 +494,12 @@ static void virtio_gpu_transfer_to_host_2d(VirtIOGPU *g,
     stride = pixman_image_get_stride(res->image);
     img_data = pixman_image_get_data(res->image);
 
+    /* The current command keeps the resource and its DMA mappings alive. */
+    had_bql = bql_locked();
+    if (had_bql) {
+        bql_unlock();
+    }
+
     if (t2d.r.x || t2d.r.width != pixman_image_get_width(res->image)) {
         for (h = 0; h < t2d.r.height; h++) {
             src_offset = t2d.offset + stride * h;
@@ -507,6 +515,10 @@ static void virtio_gpu_transfer_to_host_2d(VirtIOGPU *g,
         iov_to_buf(res->iov, res->iov_cnt, src_offset,
                    (uint8_t *)img_data + dst_offset,
                    stride * t2d.r.height);
+    }
+
+    if (had_bql) {
+        bql_lock();
     }
 }
 
