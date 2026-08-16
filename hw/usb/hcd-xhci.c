@@ -174,6 +174,10 @@ enum {
 #define TRB_TR_FRAMEID_MASK 0x7ff
 #define TRB_TR_SIA          (1<<31)
 
+#define XHCI_MFINDEX_CYCLE_UFRAMES  0x4000
+#define XHCI_MFINDEX_MASK           (XHCI_MFINDEX_CYCLE_UFRAMES - 1)
+#define XHCI_ISO_MAX_FUTURE_UFRAMES (895 * 8)
+
 #define TRB_TR_DIR          (1<<16)
 
 #define TRB_CR_SLOTID_SHIFT     24
@@ -1763,12 +1767,12 @@ static void xhci_calc_iso_kick(XHCIState *xhci, XHCITransfer *xfer,
             xfer->mfindex_kick = asap;
         }
     } else {
-        xfer->mfindex_kick = ((xfer->trbs[0].control >> TRB_TR_FRAMEID_SHIFT)
-                              & TRB_TR_FRAMEID_MASK) << 3;
-        xfer->mfindex_kick |= mfindex & ~0x3fff;
-        if (xfer->mfindex_kick + 0x100 < mfindex) {
-            xfer->mfindex_kick += 0x4000;
-        }
+        uint64_t frameid = ((xfer->trbs[0].control >> TRB_TR_FRAMEID_SHIFT)
+                            & TRB_TR_FRAMEID_MASK) << 3;
+        uint64_t delta = (frameid - mfindex) & XHCI_MFINDEX_MASK;
+
+        xfer->mfindex_kick = delta <= XHCI_ISO_MAX_FUTURE_UFRAMES ?
+                             mfindex + delta : mfindex;
     }
 }
 
