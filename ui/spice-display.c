@@ -36,6 +36,9 @@ int spice_max_refresh_rate;
 
 static GPtrArray *spice_displays;
 
+typedef QTAILQ_HEAD(SimpleSpiceUpdateHead, SimpleSpiceUpdate)
+    SimpleSpiceUpdateHead;
+
 int qemu_spice_rect_is_empty(const QXLRect* r)
 {
     return r->top == r->bottom || r->left == r->right;
@@ -123,8 +126,11 @@ void qemu_spice_wakeup(SimpleSpiceDisplay *ssd)
     spice_qxl_wakeup(&ssd->qxl);
 }
 
-static void qemu_spice_create_one_update(SimpleSpiceDisplay *ssd,
-                                         QXLRect *rect)
+static void qemu_spice_create_one_update(
+    SimpleSpiceUpdateHead *updates,
+    pixman_image_t *surface,
+    pixman_image_t *mirror,
+    QXLRect *rect)
 {
     SimpleSpiceUpdate *update;
     QXLDrawable *drawable;
@@ -165,7 +171,6 @@ static void qemu_spice_create_one_update(SimpleSpiceDisplay *ssd,
     drawable->u.copy.src_area.right  = bw;
     drawable->u.copy.src_area.bottom = bh;
 
-    QXL_SET_IMAGE_ID(image, QXL_IMAGE_GROUP_DEVICE, ssd->unique++);
     image->descriptor.type   = SPICE_IMAGE_TYPE_BITMAP;
     image->bitmap.flags      = QXL_BITMAP_DIRECT | QXL_BITMAP_TOP_DOWN;
     image->bitmap.stride     = bw * 4;
@@ -177,10 +182,10 @@ static void qemu_spice_create_one_update(SimpleSpiceDisplay *ssd,
 
     dest = pixman_image_create_bits(PIXMAN_LE_x8r8g8b8, bw, bh,
                                     (void *)update->bitmap, bw * 4);
-    pixman_image_composite(PIXMAN_OP_SRC, ssd->surface, NULL, ssd->mirror,
+    pixman_image_composite(PIXMAN_OP_SRC, surface, NULL, mirror,
                            rect->left, rect->top, 0, 0,
                            rect->left, rect->top, bw, bh);
-    pixman_image_composite(PIXMAN_OP_SRC, ssd->mirror, NULL, dest,
+    pixman_image_composite(PIXMAN_OP_SRC, mirror, NULL, dest,
                            rect->left, rect->top, 0, 0,
                            0, 0, bw, bh);
     pixman_image_unref(dest);
@@ -188,19 +193,24 @@ static void qemu_spice_create_one_update(SimpleSpiceDisplay *ssd,
     cmd->type = QXL_CMD_DRAW;
     cmd->data = (uintptr_t)drawable;
 
-    QTAILQ_INSERT_TAIL(&ssd->updates, update, next);
+    QTAILQ_INSERT_TAIL(updates, update, next);
 }
 
-static void qemu_spice_create_update(SimpleSpiceDisplay *ssd)
+static void qemu_spice_create_update(
+    SimpleSpiceUpdateHead *updates,
+    pixman_image_t *surface,
+    pixman_image_t *mirror_image,
+    const QXLRect *dirty)
 {
     static const int blksize = 32;
-    int blocks = DIV_ROUND_UP(surface_width(ssd->ds), blksize);
+    int blocks = DIV_ROUND_UP(pixman_image_get_width(surface), blksize);
     g_autofree int *dirty_top = NULL;
     int y, yoff1, yoff2, x, xoff, blk, bw;
-    int bpp = surface_bytes_per_pixel(ssd->ds);
+    int bpp = DIV_ROUND_UP(PIXMAN_FORMAT_BPP(
+                               pixman_image_get_format(surface)), 8);
     uint8_t *guest, *mirror;
 
-    if (qemu_spice_rect_is_empty(&ssd->dirty)) {
+    if (qemu_spice_rect_is_empty(dirty)) {
         return;
     };
 
@@ -209,15 +219,15 @@ static void qemu_spice_create_update(SimpleSpiceDisplay *ssd)
         dirty_top[blk] = -1;
     }
 
-    guest = surface_data(ssd->ds);
-    mirror = (void *)pixman_image_get_data(ssd->mirror);
-    for (y = ssd->dirty.top; y < ssd->dirty.bottom; y++) {
-        yoff1 = y * surface_stride(ssd->ds);
-        yoff2 = y * pixman_image_get_stride(ssd->mirror);
-        for (x = ssd->dirty.left; x < ssd->dirty.right; x += blksize) {
+    guest = (void *)pixman_image_get_data(surface);
+    mirror = (void *)pixman_image_get_data(mirror_image);
+    for (y = dirty->top; y < dirty->bottom; y++) {
+        yoff1 = y * pixman_image_get_stride(surface);
+        yoff2 = y * pixman_image_get_stride(mirror_image);
+        for (x = dirty->left; x < dirty->right; x += blksize) {
             xoff = x * bpp;
             blk = x / blksize;
-            bw = MIN(blksize, ssd->dirty.right - x);
+            bw = MIN(blksize, dirty->right - x);
             if (memcmp(guest + yoff1 + xoff,
                        mirror + yoff2 + xoff,
                        bw * bpp) == 0) {
@@ -228,7 +238,8 @@ static void qemu_spice_create_update(SimpleSpiceDisplay *ssd)
                         .left   = x,
                         .right  = x + bw,
                     };
-                    qemu_spice_create_one_update(ssd, &update);
+                    qemu_spice_create_one_update(updates, surface,
+                                                 mirror_image, &update);
                     dirty_top[blk] = -1;
                 }
             } else {
@@ -239,22 +250,22 @@ static void qemu_spice_create_update(SimpleSpiceDisplay *ssd)
         }
     }
 
-    for (x = ssd->dirty.left; x < ssd->dirty.right; x += blksize) {
+    for (x = dirty->left; x < dirty->right; x += blksize) {
         blk = x / blksize;
-        bw = MIN(blksize, ssd->dirty.right - x);
+        bw = MIN(blksize, dirty->right - x);
         if (dirty_top[blk] != -1) {
             QXLRect update = {
                 .top    = dirty_top[blk],
-                .bottom = ssd->dirty.bottom,
+                .bottom = dirty->bottom,
                 .left   = x,
                 .right  = x + bw,
             };
-            qemu_spice_create_one_update(ssd, &update);
+            qemu_spice_create_one_update(updates, surface,
+                                         mirror_image, &update);
             dirty_top[blk] = -1;
         }
     }
 
-    memset(&ssd->dirty, 0, sizeof(ssd->dirty));
 }
 
 static SimpleSpiceCursor*
@@ -384,10 +395,12 @@ void qemu_spice_display_update(SimpleSpiceDisplay *ssd,
     update_area.top = y;
     update_area.bottom = y + h;
 
-    if (qemu_spice_rect_is_empty(&ssd->dirty)) {
-        ssd->notify++;
+    WITH_QEMU_LOCK_GUARD(&ssd->lock) {
+        if (qemu_spice_rect_is_empty(&ssd->dirty)) {
+            ssd->notify++;
+        }
+        qemu_spice_rect_union(&ssd->dirty, &update_area);
     }
-    qemu_spice_rect_union(&ssd->dirty, &update_area);
 }
 
 void qemu_spice_display_switch(SimpleSpiceDisplay *ssd,
@@ -491,13 +504,67 @@ void qemu_spice_cursor_refresh_bh(void *opaque)
 
 void qemu_spice_display_refresh(SimpleSpiceDisplay *ssd)
 {
+    SimpleSpiceUpdateHead pending;
+    SimpleSpiceUpdate *update;
+    pixman_image_t *surface = NULL;
+    pixman_image_t *mirror = NULL;
+    QXLRect dirty = { 0 };
+    bool had_bql;
+    bool publish = false;
+
+    QTAILQ_INIT(&pending);
     qemu_console_hw_update(ssd->dcl.con);
 
     WITH_QEMU_LOCK_GUARD(&ssd->lock) {
-        if (QTAILQ_EMPTY(&ssd->updates) && ssd->ds) {
-            qemu_spice_create_update(ssd);
-            ssd->notify++;
+        if (QTAILQ_EMPTY(&ssd->updates) && ssd->ds &&
+            !qemu_spice_rect_is_empty(&ssd->dirty)) {
+            surface = pixman_image_ref(ssd->surface);
+            mirror = pixman_image_ref(ssd->mirror);
+            dirty = ssd->dirty;
+            memset(&ssd->dirty, 0, sizeof(ssd->dirty));
         }
+    }
+
+    if (surface) {
+        had_bql = bql_locked();
+        if (had_bql) {
+            bql_unlock();
+        }
+        qemu_spice_create_update(&pending, surface, mirror, &dirty);
+        if (had_bql) {
+            bql_lock();
+        }
+
+        WITH_QEMU_LOCK_GUARD(&ssd->lock) {
+            if (ssd->surface == surface && ssd->mirror == mirror) {
+                while ((update = QTAILQ_FIRST(&pending)) != NULL) {
+                    QTAILQ_REMOVE(&pending, update, next);
+                    QXL_SET_IMAGE_ID(&update->image, QXL_IMAGE_GROUP_DEVICE,
+                                     ssd->unique++);
+                    QTAILQ_INSERT_TAIL(&ssd->updates, update, next);
+                }
+                ssd->notify++;
+                publish = true;
+            } else if (ssd->surface && ssd->mirror) {
+                QXLRect full = {
+                    .left = 0,
+                    .top = 0,
+                    .right = pixman_image_get_width(ssd->surface),
+                    .bottom = pixman_image_get_height(ssd->surface),
+                };
+
+                qemu_spice_rect_union(&ssd->dirty, &full);
+            }
+        }
+
+        if (!publish) {
+            while ((update = QTAILQ_FIRST(&pending)) != NULL) {
+                QTAILQ_REMOVE(&pending, update, next);
+                qemu_spice_destroy_update(ssd, update);
+            }
+        }
+        pixman_image_unref(surface);
+        pixman_image_unref(mirror);
     }
 
     trace_qemu_spice_display_refresh(ssd->qxl.id, ssd->notify);
